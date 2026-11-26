@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>چت سه نفره</title>
+<style>
+  * { box-sizing: border-box; font-family: Tahoma, sans-serif; }
+  body { margin: 0; min-height: 100vh; display: flex; justify-content: center; align-items: center; background: linear-gradient(135deg, #667eea, #764ba2); }
+  .screen { background: #fff; border-radius: 16px; padding: 24px; width: min(340px, 94vw); box-shadow: 0 10px 30px rgba(0,0,0,.3); }
+  .hidden { display: none !important; }
+  h2 { text-align: center; margin-top: 0; color: #333; }
+  input { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #ccc; border-radius: 8px; font-size: 14px; }
+  button { padding: 12px; margin-top: 8px; background: #667eea; color: #fff; border: none; border-radius: 8px; font-size: 15px; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: wait; }
+  #error { color: #c0392b; font-size: 13px; text-align: center; margin-top: 8px; }
+  #chatScreen { display: flex; flex-direction: column; width: 100%; max-width: 480px; height: 100vh; min-height: 420px; background: #fff; }
+  #header { background: #667eea; color: #fff; padding: 14px 18px; display: flex; justify-content: space-between; align-items: center; font-weight: bold; }
+  #logout { background: rgba(255,255,255,.25); width: auto; padding: 6px 12px; margin: 0; font-size: 13px; }
+  #connection { padding: 6px 12px; font-size: 12px; background: #f5f6fa; color: #555; }
+  #onlineUsers { padding: 8px 12px; background: #eef1ff; color: #333; font-size: 12px; border-bottom: 1px solid #e5e7eb; }
+  #messages { flex: 1; overflow-y: auto; padding: 16px; background: #f5f6fa; display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 12px; font-size: 14px; overflow-wrap: anywhere; }
+  .mine { align-self: flex-start; background: #667eea; color: #fff; border-bottom-right-radius: 4px; }
+  .theirs { align-self: flex-end; background: #e4e6eb; color: #333; border-bottom-left-radius: 4px; }
+  .sender-name { font-size: 11px; opacity: .7; margin-bottom: 3px; }
+  #inputArea { display: flex; padding: 12px; gap: 8px; border-top: 1px solid #eee; background: #fff; }
+  #msgInput { flex: 1; min-width: 0; margin: 0; }
+  #sendBtn { width: auto; padding: 12px 20px; margin: 0; }
+  #sendError { color: #c0392b; font-size: 12px; padding: 0 12px 8px; }
+</style>
+</head>
+<body>
+<div id="loginScreen" class="screen">
+  <h2>🔐 ورود به چت</h2>
+  <input id="nameInput" placeholder="نام شما" autocomplete="nickname">
+  <input id="passInput" type="password" placeholder="رمز ورود مشترک">
+  <button id="loginBtn" style="width:100%" onclick="login()">ورود</button>
+  <div id="error" role="alert"></div>
+</div>
+
+<div id="chatScreen" class="hidden">
+  <div id="header">
+    <span>💬 چت خصوصی</span>
+    <button id="logout" onclick="logout()">خروج</button>
+  </div>
+  <div id="connection">در حال اتصال...</div>
+  <div id="onlineUsers">آنلاین‌ها: در حال دریافت وضعیت...</div>
+  <div id="messages" aria-live="polite"></div>
+  <div id="inputArea">
+    <input id="msgInput" placeholder="پیام خود را بنویسید..." maxlength="2000" onkeydown="if(event.key==='Enter') sendMsg()">
+    <button id="sendBtn" onclick="sendMsg()">ارسال</button>
+  </div>
+  <div id="sendError" role="alert"></div>
+</div>
+
+<script>
+  // همه اعضای گروه باید دقیقاً از همین نام کانال استفاده کنند.
+  const CHAT_PASSWORD = "8585";
+  const CHANNEL_NAME = "chat-3nafar-gizli-2024";
+  const TOPIC_URL = "https://ntfy.sh/" + encodeURIComponent(CHANNEL_NAME);
+  const HISTORY_KEY = "chat_history_" + CHANNEL_NAME;
+  const HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+  const loginScreen = document.getElementById("loginScreen");
+  const chatScreen = document.getElementById("chatScreen");
+  const messagesEl = document.getElementById("messages");
+  const errorEl = document.getElementById("error");
+  const connectionEl = document.getElementById("connection");
+  const sendErrorEl = document.getElementById("sendError");
+  const msgInput = document.getElementById("msgInput");
+  const sendBtn = document.getElementById("sendBtn");
+
+  let myName = "";
+  let eventSource = null;
+  let seenIds = new Set();
+  const PRESENCE_INTERVAL_MS = 25000;
+  const PRESENCE_TIMEOUT_MS = 70000;
+  const onlineUsers = new Map();
+  let presenceTimer = null;
+  let presenceCleanupTimer = null;
+
+  function renderOnlineUsers() {
+    const now = Date.now();
+    for (const [name, lastSeen] of onlineUsers) {
+      if (now - lastSeen > PRESENCE_TIMEOUT_MS) onlineUsers.delete(name);
+    }
+    const names = [...onlineUsers.keys()].sort((a, b) => a.localeCompare(b, "fa"));
+    document.getElementById("onlineUsers").textContent =
+      names.length ? "🟢 آنلاین‌ها (" + names.length + "): " + names.join("، ") :
+      "آنلاین‌ها: فعلاً کسی آنلاین نیست";
+  }
+
+  async function sendPresence(online = true) {
+    if (!myName) return;
+    try {
+      await fetch(TOPIC_URL, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        body: JSON.stringify({ type: "presence", from: myName, online: online, at: Date.now() })
+      });
+    } catch (err) {
+      console.warn("ارسال وضعیت آنلاین ناموفق بود:", err);
+    }
+  }
+
+  function startPresence() {
+    onlineUsers.set(myName, Date.now());
+    renderOnlineUsers();
+    sendPresence(true);
+    presenceTimer = setInterval(() => sendPresence(true), PRESENCE_INTERVAL_MS);
+    presenceCleanupTimer = setInterval(renderOnlineUsers, 10000);
+  }
+
+  function stopPresence() {
+    sendPresence(false);
+    if (presenceTimer) clearInterval(presenceTimer);
+    if (presenceCleanupTimer) clearInterval(presenceCleanupTimer);
+    presenceTimer = null;
+    presenceCleanupTimer = null;
+    onlineUsers.delete(myName);
+    renderOnlineUsers();
+  }
+
+  function loadHistory() {
+    const now = Date.now();
+    let history = [];
+    try {
+      history = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+      if (!Array.isArray(history)) history = [];
+    } catch (err) {
+      history = [];
+    }
+
+    history = history.filter(item =>
+      item && typeof item.from === "string" &&
+      typeof item.text === "string" &&
+      Number.isFinite(item.time) &&
+      now - item.time < HISTORY_MAX_AGE_MS
+    );
+
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    } catch (err) {
+      console.warn("ذخیره تاریخچه در این مرورگر ممکن نیست:", err);
+    }
+
+    history.sort((a, b) => a.time - b.time);
+    history.forEach(item => {
+      if (item.id) seenIds.add(item.id);
+      renderMessage(item);
+    });
+  }
+
+  function saveHistory(item) {
+    const now = Date.now();
+    let history = [];
+    try {
+      history = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+      if (!Array.isArray(history)) history = [];
+    } catch (err) {
+      history = [];
+    }
+
+    history = history.filter(old =>
+      old && Number.isFinite(old.time) &&
+      now - old.time < HISTORY_MAX_AGE_MS
+    );
+
+    history.push(item);
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    } catch (err) {
+      console.warn("ذخیره تاریخچه ناموفق بود:", err);
+    }
+  }
+
+  window.login = function () {
+    const name = document.getElementById("nameInput").value.trim();
+    const pass = document.getElementById("passInput").value;
+    errorEl.textContent = "";
+
+    if (!name) { errorEl.textContent = "نام را وارد کنید."; return; }
+    if (pass !== CHAT_PASSWORD) { errorEl.textContent = "رمز ورود اشتباه است."; return; }
+
+    myName = name;
+    loginScreen.classList.add("hidden");
+    chatScreen.classList.remove("hidden");
+    loadHistory();
+    connectToChannel();
+    startPresence();
+  };
+
+  window.logout = function () {
+    stopPresence();
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+    chatScreen.classList.add("hidden");
+    loginScreen.classList.remove("hidden");
+    document.getElementById("passInput").value = "";
+    messagesEl.replaceChildren();
+    seenIds.clear();
+    onlineUsers.clear();
+    renderOnlineUsers();
+    connectionEl.textContent = "قطع اتصال";
+    sendErrorEl.textContent = "";
+    myName = "";
+  };
+
+  function connectToChannel() {
+    if (eventSource) eventSource.close();
+
+    connectionEl.textContent = "در حال اتصال به کانال...";
+    eventSource = new EventSource(TOPIC_URL + "/sse");
+
+    eventSource.onopen = function () {
+      connectionEl.textContent = "🟢 متصل به کانال";
+    };
+
+    eventSource.onmessage = function (event) {
+      try {
+        const data = JSON.parse(event.data);
+
+        // رویدادهای ntfy معمولاً یک شیء JSON با event و message هستند.
+        if (data.event !== "message" || !data.message) return;
+
+        const msg = JSON.parse(data.message);
+        if (typeof msg.from !== "string") return;
+
+        if (msg.type === "presence") {
+          if (msg.online === false) onlineUsers.delete(msg.from);
+          else onlineUsers.set(msg.from, Date.now());
+          renderOnlineUsers();
+          return;
+        }
+
+        if (typeof msg.text !== "string") return;
+
+        // از نمایش دوباره یک پیام در صورت دریافت تکراری جلوگیری می‌کند.
+        const id = data.id || (msg.from + "|" + msg.text + "|" + data.time);
+        if (seenIds.has(id)) return;
+        seenIds.add(id);
+
+        const timestamp = Number(data.time);
+        const messageTime = Number.isFinite(timestamp) && timestamp > 0
+          ? (timestamp < 1000000000000 ? timestamp * 1000 : timestamp)
+          : Date.now();
+
+        const savedMessage = {
+          id: id,
+          from: msg.from,
+          text: msg.text,
+          time: messageTime
+        };
+
+        saveHistory(savedMessage);
+        renderMessage(savedMessage);
+      } catch (err) {
+        console.warn("داده دریافتی قابل پردازش نبود:", err);
+      }
+    };
+
+    eventSource.onerror = function () {
+      connectionEl.textContent = "🟠 اتصال قطع شده؛ تلاش برای اتصال مجدد...";
+    };
+  }
+
+  function renderMessage(data) {
+    const div = document.createElement("div");
+    div.className = "msg " + (data.from === myName ? "mine" : "theirs");
+
+    const nameEl = document.createElement("div");
+    nameEl.className = "sender-name";
+    nameEl.textContent = data.from;
+
+    const textEl = document.createElement("div");
+    textEl.textContent = data.text;
+
+    div.append(nameEl, textEl);
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  window.sendMsg = async function () {
+    const messageText = msgInput.value.trim();
+    if (!messageText || sendBtn.disabled) return;
+
+    sendBtn.disabled = true;
+    sendErrorEl.textContent = "";
+
+    try {
+      const response = await fetch(TOPIC_URL, {
+        method: "POST",
+        // text/plain از درخواست preflight غیرضروری در مرورگر جلوگیری می‌کند.
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        body: JSON.stringify({ from: myName, text: messageText })
+      });
+
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error("سرور پاسخ " + response.status + " داد. " + detail);
+      }
+
+      msgInput.value = "";
+      msgInput.focus();
+      sendErrorEl.textContent = "";
+    } catch (err) {
+      console.error("Send failed:", err);
+      sendErrorEl.textContent =
+        "ارسال ناموفق بود. اتصال اینترنت و دسترسی به ntfy.sh را بررسی کنید. (" +
+        (err.message || "خطای شبکه") + ")";
+    } finally {
+      sendBtn.disabled = false;
+    }
+  };
+  window.addEventListener("pagehide", () => {
+    if (myName) {
+      const payload = JSON.stringify({ type: "presence", from: myName, online: false, at: Date.now() });
+      try {
+        navigator.sendBeacon(TOPIC_URL, new Blob([payload], { type: "text/plain;charset=UTF-8" }));
+      } catch (err) {}
+    }
+  });
+</script>
+</body>
+</html>
